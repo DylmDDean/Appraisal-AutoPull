@@ -1,0 +1,35 @@
+To: {{ payload.get('recipient_name', 'PVA office') }}
+Subject: PVA inquiry for {{ address }}
+
+{% set contact = payload.get('contact') %}
+
+{% if contact and contact.get('name') %}
+Hello {{ contact.get('name') }},
+{% else %}
+Hello PVA staff,
+{% endif %}
+
+Please provide the property value card for the following property:
+
+- Address: {{ address }}{% if city %}, {{ city }}{% endif %}
+- Property ID: {{ payload.get('property_id', 'N/A') }}
+
+Contact for follow-up:
+- Name: {% if contact and contact.get('name') %}{{ contact.get('name') }}{% else %}N/A{% endif %}
+- Email: {% if contact and contact.get('email') %}{{ contact.get('email') }}{% else %}N/A{% endif %}
+- Phone: {% if contact and contact.get('phone') %}{{ contact.get('phone') }}{% else %}N/A{% endif %}
+
+Additional notes:
+{{ payload.get('notes', 'No additional notes provided.') }}
+
+{% if payload %}
+Full payload:
+{% for k, v in payload.items() %}
+- {{ k }}: {{ v }}
+{% endfor %}
+{% endif %}
+
+Please reply with the property value card or documentation required.
+
+Thanks,
+Automated requests service

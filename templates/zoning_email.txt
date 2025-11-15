@@ -1,0 +1,16 @@
+To: {{ payload.get('recipient_name', 'Zoning office') }}
+Subject: Zoning inquiry for {{ address }}
+
+Hello,
+
+We are requesting zoning information for the property at {{ address }}{% if city %}, {{ city }}{% endif %}.
+
+Details:
+- Address: {{ address }}
+- Payload:
+{{ payload_json }}
+
+Please advise on current zoning classification, permitted uses, and any known variances.
+
+Thanks,
+Automated requests service
