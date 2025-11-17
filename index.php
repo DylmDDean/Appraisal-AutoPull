@@ -71,6 +71,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   <div class="container">
     <h1>Send Requests</h1>
 
+    <!-- Email capture section -->
+    <div style="background: #eff6ff; padding: 20px; border-radius: 8px; margin-bottom: 24px; border: 2px solid #3b82f6;">
+      <h2 style="margin-top: 0; color: #1e40af; font-size: 20px;">📧 Save Your Email</h2>
+      <p style="margin: 8px 0; color: #1e3a8a;">Get notifications about your requests! Enter your email below and we'll send you a verification link.</p>
+      <div style="display: flex; gap: 10px; margin-top: 12px;">
+        <input 
+          type="email" 
+          id="email-input" 
+          placeholder="your.email@example.com" 
+          style="flex: 1; padding: 12px; font-size: 16px; border: 2px solid #3b82f6; border-radius: 6px;"
+        />
+        <button 
+          id="save-email-btn" 
+          style="background: #2563eb; color: white; border: none; padding: 12px 24px; 
+                 font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer; 
+                 white-space: nowrap;"
+        >
+          Save My Email
+        </button>
+      </div>
+      <p style="font-size: 13px; color: #64748b; margin: 8px 0 0 0;">
+        We'll only use your email to notify you about your property requests.
+      </p>
+    </div>
+
     <form method="post" novalidate>
       <label>Address (required)
         <input type="text" name="address" required value="<?= htmlspecialchars($_POST['address'] ?? '') ?>" />
@@ -171,5 +196,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     border-color: #e53;
   }
   </style>
+
+  <!-- Email save feature script -->
+  <script src="/static/save_email.js"></script>
 </body>
 </html>
