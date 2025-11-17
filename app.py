@@ -3,10 +3,10 @@
 Flask backend for sending PVA and Zoning requests via email using SMTP.
 
 Changes in this version:
+- Supports Grant County district-level zoning by city.
 - Replaced SendGrid usage with an SMTP sender (smtplib).
 - send_email_via_smtp reads SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS and SENDER_EMAIL/SENDER_NAME from env.
 - If SMTP is not configured, the send is simulated (useful for local testing).
-- County-level mapping remains hard-locked (Carroll -> bethany.petry@ky.gov / brianmumphrey@carrolltonky.net).
 """
 from flask import Flask, request, jsonify
 import os
@@ -32,17 +32,60 @@ env = Environment(
     autoescape=False
 )
 
-# In-memory default mappings (can be loaded/overridden with CSV)
 CITY_EMAIL_MAP: Dict[str, Dict[str, str]] = {
     "Springfield": {"pva": "pva@springfield.gov", "zoning": "zoning@springfield.gov"},
     "Metropolis": {"pva": "pva@metropolis.gov", "zoning": "zoning@metropolis.gov"},
 }
 
-# Hard-locked county mapping: Carroll county -> fixed PVA and Zoning addresses
+# Grant County Zoning per City
+GRANT_CITY_ZONING_MAP: Dict[str, str] = {
+    "corinth": "", # TODO: insert real email if/when available
+    "crittenden": "dmartin@cityofcrittendenky.gov",
+    "dry ridge": "", # TODO: insert real email if/when available
+    "williamstown": "cityofwtown@wtownky.org"
+}
+
+# Hard-locked county mapping
 COUNTY_EMAIL_MAP: Dict[str, Dict[str, str]] = {
-    "Carroll": {
+    "anderson": {
+        "pva": "BStivers41@gmail.com",
+        "zoning": "rachelle.lile@roadrunner.com"
+    },
+    "boone": {
+        "pva": "pva@boonecountyky.org",
+        "zoning": "plancom@boonecountyky.org"
+    },
+    "carroll": {
         "pva": "bethany.petry@ky.gov",
         "zoning": "brianmumphrey@carrolltonky.net"
+    },
+    "franklin": {
+        "pva": "Angie.obanion@ky.gov",
+        "zoning": "autumn.goderwis@franklincounty.ky.gov"
+    },
+    "gallatin": {
+        "pva": "Sheryl.jones@ky.gov",
+        "zoning": "jhansen@gallatinky.org"
+    },
+    "grant": {
+        "pva": "Elliott.Anderson@ky.gov",
+        # zoning falls to GRANT_CITY_ZONING_MAP
+    },
+    "kenton": {
+        "pva": "info.kentonpva@kentoncounty.org",
+        "zoning": "webmaster01@pdskc.org"   
+    },
+    "owen": {
+        "pva": "blake.robertson@ky.gov",
+        "zoning": ""   # TODO: insert real email if/when available
+    },
+    "scott": {
+        "pva": "Tony.McDonald@ky.gov",
+        "zoning": "rshirley@gscplanning.com"   
+    },
+    "trimble": {
+        "pva": "JillM.Mahoney@ky.gov",
+        "zoning": ""   # TODO: insert real email if/when available
     },
 }
 
@@ -55,17 +98,10 @@ DEFAULT_EMAILS: Dict[str, str] = {
 def normalize_key(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
-    # collapse whitespace and lowercase for stable comparisons
     return " ".join(s.strip().split()).lower()
 
 
 def load_email_mappings_from_csv(csv_path: str) -> None:
-    """
-    Load mappings from a CSV file with columns:
-      type,key,pva_email,zoning_email
-    type: city or county
-    This will merge into CITY_EMAIL_MAP and COUNTY_EMAIL_MAP.
-    """
     if not os.path.exists(csv_path):
         logger.info("CSV mapping file not found: %s", csv_path)
         return
@@ -95,10 +131,6 @@ def load_email_mappings_from_csv(csv_path: str) -> None:
 
 
 def extract_city_from_address(address: Optional[str]) -> Optional[str]:
-    """
-    Heuristic: split on commas and assume the city is the second-to-last component
-    in a typical "street, city, state zip" format.
-    """
     if not address:
         return None
     parts = [p.strip() for p in address.split(",") if p.strip()]
@@ -109,22 +141,33 @@ def extract_city_from_address(address: Optional[str]) -> Optional[str]:
 
 def get_emails_for_location(city: Optional[str], county: Optional[str]) -> Dict[str, str]:
     """
-    Lookup priority: county -> city -> DEFAULT_EMAILS.
-    County mappings are hard-locked: if a county entry exists it will always be used.
+    Lookup priority:
+      - if Grant county: override zoning with city-specific zoning if possible
+      - fallback to county
+      - fallback to city
+      - fallback to default
     """
     city_n = normalize_key(city)
     county_n = normalize_key(county)
 
-    # 1) County lookup (hard-locked, precedence)
+    # 1. Special handling for Grant county zoning by city
+    if county_n == "grant":
+        emails = COUNTY_EMAIL_MAP.get("grant", {}).copy()
+        if city_n and city_n in GRANT_CITY_ZONING_MAP and GRANT_CITY_ZONING_MAP[city_n]:
+            emails["zoning"] = GRANT_CITY_ZONING_MAP[city_n]
+        emails = {**DEFAULT_EMAILS, **emails}
+        logger.info("(Grant) Zoning for city '%s': %s", city_n, emails.get("zoning"))
+        return emails
+
+    # 2) County lookup (hard-locked, precedence)
     if county_n:
         for k, v in COUNTY_EMAIL_MAP.items():
             if normalize_key(k) == county_n:
                 logger.info("Using county-level mapping for '%s' -> %s", k, v)
-                # merge with defaults so missing roles fall back
                 merged = {**DEFAULT_EMAILS, **v}
                 return merged
 
-    # 2) City lookup (only when no county mapping)
+    # 3) City lookup (only when no county mapping)
     if city_n:
         for k, v in CITY_EMAIL_MAP.items():
             if normalize_key(k) == city_n:
@@ -132,7 +175,7 @@ def get_emails_for_location(city: Optional[str], county: Optional[str]) -> Dict[
                 merged = {**DEFAULT_EMAILS, **v}
                 return merged
 
-    # 3) Fallback default
+    # 4) Fallback default
     logger.info("No mapping found for city=%s county=%s; using defaults", city, county)
     return DEFAULT_EMAILS.copy()
 
@@ -143,12 +186,6 @@ def render_template_file(filename: str, context: dict) -> str:
 
 
 def send_email_via_smtp(to_email: str, subject: str, body_text: str) -> dict:
-    """
-    Send email via SMTP using environment variables:
-      SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SENDER_EMAIL, SENDER_NAME
-
-    If SMTP is not configured, a simulated success response is returned for local testing.
-    """
     smtp_host = os.environ.get("SMTP_HOST")
     smtp_port = int(os.environ.get("SMTP_PORT", "465"))
     smtp_user = os.environ.get("SMTP_USER")
@@ -187,16 +224,6 @@ def send_email_via_smtp(to_email: str, subject: str, body_text: str) -> dict:
 
 @app.route("/api/send-requests", methods=["POST"])
 def send_requests():
-    """
-    Expected JSON:
-    {
-      "address": "123 Main St, Springfield, IL 62701",
-      "city": "Springfield",   # optional; if not provided we try to parse from address
-      "county": "Sangamon",    # optional; used as hard-locked override if present
-      "property_id": "ABC123", # optional
-      ...
-    }
-    """
     try:
         data = request.get_json(force=True)
     except Exception as e:
@@ -215,7 +242,9 @@ def send_requests():
     pva_email = emails.get("pva")
     zoning_email = emails.get("zoning")
 
-    # Build template context
+    send_to_pva = data.get("send_to_pva", True)
+    send_to_zoning = data.get("send_to_zoning", True)
+
     template_context = {
         "address": address,
         "city": city,
@@ -224,7 +253,6 @@ def send_requests():
         "payload_json": json.dumps(data, indent=2)
     }
 
-    # Render templates
     try:
         pva_body = render_template_file("pva_email.txt", template_context)
         zoning_body = render_template_file("zoning_email.txt", template_context)
@@ -236,35 +264,43 @@ def send_requests():
         return jsonify({"success": False, "error": "Template rendering error", "details": str(e)}), 500
 
     results = {}
-    # Send to PVA
-    if not pva_email:
-        results["pva"] = {"error": "No PVA recipient configured"}
-    else:
-        try:
-            results["pva"] = send_email_via_smtp(
-                to_email=pva_email,
-                subject=f"PVA request for {address}",
-                body_text=pva_body
-            )
-        except Exception as e:
-            logger.exception("Failed to send PVA email")
-            results["pva"] = {"error": str(e)}
 
-    # Send to Zoning
-    if not zoning_email:
-        results["zoning"] = {"error": "No Zoning recipient configured"}
+    if send_to_pva:
+        if not pva_email:
+            results["pva"] = {"error": "No PVA recipient configured"}
+        else:
+            try:
+                results["pva"] = send_email_via_smtp(
+                    to_email=pva_email,
+                    subject=f"PVA request for {address}",
+                    body_text=pva_body
+                )
+            except Exception as e:
+                logger.exception("Failed to send PVA email")
+                results["pva"] = {"error": str(e)}
     else:
-        try:
-            results["zoning"] = send_email_via_smtp(
-                to_email=zoning_email,
-                subject=f"Zoning request for {address}",
-                body_text=zoning_body
-            )
-        except Exception as e:
-            logger.exception("Failed to send Zoning email")
-            results["zoning"] = {"error": str(e)}
+        results["pva"] = {"skipped": True}
 
-    success = ("error" not in results.get("pva", {})) and ("error" not in results.get("zoning", {}))
+    if send_to_zoning:
+        if not zoning_email:
+            results["zoning"] = {"error": "No Zoning recipient configured"}
+        else:
+            try:
+                results["zoning"] = send_email_via_smtp(
+                    to_email=zoning_email,
+                    subject=f"Zoning request for {address}",
+                    body_text=zoning_body
+                )
+            except Exception as e:
+                logger.exception("Failed to send Zoning email")
+                results["zoning"] = {"error": str(e)}
+    else:
+        results["zoning"] = {"skipped": True}
+
+    success = (
+        ("error" not in results.get("pva", {}) if send_to_pva else True) and
+        ("error" not in results.get("zoning", {}) if send_to_zoning else True)
+    )
     status_code = 200 if success else 500
 
     return jsonify({
@@ -278,8 +314,6 @@ def send_requests():
 
 
 if __name__ == "__main__":
-    # Optional: load CSV mappings if you keep a mappings.csv in the project root
     csv_path = os.path.join(BASE_DIR, "mappings.csv")
     load_email_mappings_from_csv(csv_path)
-    # For local dev only. Use a proper WSGI server (gunicorn/uvicorn) in production.
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
