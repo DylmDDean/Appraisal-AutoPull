@@ -7,17 +7,24 @@ Changes in this version:
 - Replaced SendGrid usage with an SMTP sender (smtplib).
 - send_email_via_smtp reads SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS and SENDER_EMAIL/SENDER_NAME from env.
 - If SMTP is not configured, the send is simulated (useful for local testing).
+- Added email capture and verification feature with /save_email and /confirm_email endpoints.
 """
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect, send_from_directory
 import os
 import logging
 import json
 import csv
 import smtplib
 import ssl
+import secrets
+import re
 from email.message import EmailMessage
 from typing import Optional, Dict
 from jinja2 import Environment, FileSystemLoader
+
+# Import email verification modules
+import emails_db
+import email_sender
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -313,7 +320,194 @@ def send_requests():
     }), status_code
 
 
+# Simple email validation regex
+EMAIL_REGEX = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
+
+
+def is_valid_email(email: str) -> bool:
+    """Validate email format using a simple regex."""
+    return EMAIL_REGEX.match(email) is not None
+
+
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    """Serve static files (JS, CSS, etc.)"""
+    return send_from_directory('static', filename)
+
+
+@app.route("/save_email", methods=["POST"])
+def save_email():
+    """
+    Accept email from user, validate, generate verification token, and send verification email.
+    
+    Security notes:
+    - TODO: Add rate limiting in production to prevent abuse (e.g., Flask-Limiter)
+    - TODO: Add CAPTCHA for additional protection against bots
+    - Uses centralized app SMTP credentials (no per-user SMTP storage in this phase)
+    """
+    # Accept both JSON and form data
+    if request.is_json:
+        data = request.get_json()
+        email = data.get("email", "").strip()
+    else:
+        email = request.form.get("email", "").strip()
+    
+    # Validate email
+    if not email:
+        return jsonify({"success": False, "message": "Email address is required"}), 400
+    
+    if not is_valid_email(email):
+        return jsonify({"success": False, "message": "Invalid email format"}), 400
+    
+    # Check if email already exists
+    if emails_db.email_exists(email):
+        return jsonify({
+            "success": False, 
+            "message": "This email is already registered. Please check your inbox for the verification email."
+        }), 400
+    
+    # Generate secure verification token
+    token = secrets.token_urlsafe(32)
+    
+    # Add pending email to database
+    if not emails_db.add_pending_email(email, token):
+        return jsonify({
+            "success": False,
+            "message": "Unable to save email. Please try again."
+        }), 500
+    
+    # Send verification email
+    try:
+        email_sender.send_verification(email, token)
+        logger.info("Verification email sent to: %s", email)
+        return jsonify({
+            "success": True,
+            "message": "Verification email sent! Please check your inbox."
+        }), 200
+    except ValueError as e:
+        # SMTP not configured
+        logger.error("SMTP configuration error: %s", e)
+        return jsonify({
+            "success": False,
+            "message": "Email service is not configured. Please contact support."
+        }), 500
+    except Exception as e:
+        # Other send failures
+        logger.exception("Failed to send verification email: %s", e)
+        return jsonify({
+            "success": False,
+            "message": "Failed to send verification email. Please try again later."
+        }), 500
+
+
+@app.route("/confirm_email", methods=["GET"])
+def confirm_email():
+    """
+    Verify email using the token from the verification link.
+    Marks the email as confirmed and shows a friendly success page.
+    """
+    token = request.args.get("token", "").strip()
+    
+    if not token:
+        return """
+        <!DOCTYPE html>
+        <html>
+        <head><title>Invalid Link</title></head>
+        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+            <h1 style="color: #dc2626;">Invalid Verification Link</h1>
+            <p>The verification link is missing required information.</p>
+        </body>
+        </html>
+        """, 400
+    
+    # Attempt to confirm the email
+    if emails_db.confirm_email(token):
+        email_data = emails_db.get_email_by_token(token)
+        email_address = email_data.get("email", "your email") if email_data else "your email"
+        
+        logger.info("Email confirmed: %s", email_address)
+        
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>Email Verified!</title>
+            <style>
+                body {{
+                    font-family: Arial, sans-serif;
+                    text-align: center;
+                    padding: 50px;
+                    background: #f9fafb;
+                }}
+                .container {{
+                    max-width: 600px;
+                    margin: 0 auto;
+                    background: white;
+                    padding: 40px;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                }}
+                h1 {{ color: #059669; }}
+                .checkmark {{
+                    font-size: 64px;
+                    color: #059669;
+                    margin-bottom: 20px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="checkmark">✓</div>
+                <h1>Email Verified!</h1>
+                <p>Thank you for verifying your email address: <strong>{email_address}</strong></p>
+                <p>You're all set!</p>
+            </div>
+        </body>
+        </html>
+        """, 200
+    else:
+        # Token not found or already confirmed
+        return """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>Verification Failed</title>
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    text-align: center;
+                    padding: 50px;
+                    background: #f9fafb;
+                }
+                .container {
+                    max-width: 600px;
+                    margin: 0 auto;
+                    background: white;
+                    padding: 40px;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                }
+                h1 { color: #dc2626; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Verification Failed</h1>
+                <p>This verification link is invalid or has already been used.</p>
+                <p>If you need a new verification email, please submit your email again.</p>
+            </div>
+        </body>
+        </html>
+        """, 400
+
+
 if __name__ == "__main__":
+    # Initialize email verification database
+    emails_db.init_db()
+    logger.info("Email verification database initialized")
+    
     csv_path = os.path.join(BASE_DIR, "mappings.csv")
     load_email_mappings_from_csv(csv_path)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
