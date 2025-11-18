@@ -131,6 +131,21 @@ $checked_zoning = $isPost ? (isset($_POST['send_to_zoning']) ? 'checked' : '') :
       </div>
     </form>
 
+    <!-- Inserted email-capture UI block (saves user contact & triggers /save_email) -->
+    <div id="save-email-block" style="max-width:420px;margin:20px auto;padding:16px;border:1px solid #eee;border-radius:8px;">
+      <h3>Save your contact</h3>
+      <p style="font-size:0.9em;color:#555">Enter your email so replies from officials go to you. We’ll send one quick confirmation.</p>
+      <input id="email-input" name="email" type="email" placeholder="you@example.com" style="width:100%;padding:10px;margin:8px 0;border-radius:6px;border:1px solid #ccc" />
+      <input id="name-input" name="name" type="text" placeholder="Your name (optional)" style="width:100%;padding:10px;margin:8px 0;border-radius:6px;border:1px solid #ccc" />
+      <label style="display:block;margin-bottom:8px;font-size:0.9em;">
+        <input id="optin-checkbox" type="checkbox" checked /> I agree to have my contact used to send requests
+      </label>
+      <button id="save-email-btn" style="width:100%;padding:12px;background:#1a73e8;color:#fff;border:none;border-radius:6px;font-size:1em;cursor:pointer;">
+        Save my email
+      </button>
+      <div id="save-email-message" role="status" style="margin-top:10px;"></div>
+    </div>
+
     <?php if ($error): ?>
       <div class="result error" style="margin-top:16px;background:#fee;padding:12px;border-radius:6px;"><strong>Error:</strong> <?= htmlspecialchars($error, ENT_QUOTES) ?></div>
     <?php elseif ($response): ?>
@@ -184,6 +199,9 @@ $checked_zoning = $isPost ? (isset($_POST['send_to_zoning']) ? 'checked' : '') :
     renderCityField();
   });
   </script>
+
+<!-- with this (server-side inserts the nonce) -->
+<script nonce="<?= htmlspecialchars($nonce, ENT_QUOTES) ?>" src="/static/save_email.js"></script>
 
   <style>
   /* Optional: visually indicate when city is required for Grant */

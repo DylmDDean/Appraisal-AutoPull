@@ -2,13 +2,14 @@
 """
 Flask backend for sending PVA and Zoning requests via email using SMTP.
 
-Changes in this version:
-- Supports Grant County district-level zoning by city.
-- Replaced SendGrid usage with an SMTP sender (smtplib).
-- send_email_via_smtp reads SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS and SENDER_EMAIL/SENDER_NAME from env.
-- If SMTP is not configured, the send is simulated (useful for local testing).
+Changes:
+- Adds a small contacts/email-save + verification flow (SQLite-backed) with:
+  - POST /save_email  -> create pending email + send verification
+  - GET  /confirm_email?token=... -> confirm the pending email
+- Keeps existing /api/send-requests behavior.
+- send_email_via_smtp now supports setting Reply-To.
 """
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect, make_response
 import os
 import logging
 import json
@@ -18,6 +19,10 @@ import ssl
 from email.message import EmailMessage
 from typing import Optional, Dict
 from jinja2 import Environment, FileSystemLoader
+import sqlite3
+from datetime import datetime
+import secrets
+import re
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(__file__)
 TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
+DB_PATH = os.path.join(BASE_DIR, "emails.db")
 
 # Jinja environment for plain text templates (no autoescape for plain text)
 env = Environment(
@@ -185,7 +191,92 @@ def render_template_file(filename: str, context: dict) -> str:
     return tpl.render(**context)
 
 
-def send_email_via_smtp(to_email: str, subject: str, body_text: str) -> dict:
+# -----------------------------------------------------------------------------
+# Simple SQLite-backed emails/contacts helpers (minimal and local)
+# -----------------------------------------------------------------------------
+EMAILS_TABLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS emails (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    email TEXT NOT NULL UNIQUE,
+    token TEXT,
+    confirmed INTEGER DEFAULT 0,
+    opt_in INTEGER DEFAULT 1,
+    created_at TEXT,
+    confirmed_at TEXT
+);
+"""
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def init_contacts_db(db_path: str = DB_PATH) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(EMAILS_TABLE_SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def add_pending_email(email: str, name: Optional[str], token: str, opt_in: bool = True, db_path: str = DB_PATH) -> bool:
+    """Insert or update a pending email with token. Return True on insert/update."""
+    now = datetime.utcnow().isoformat()
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        # If email already exists and is confirmed, return False to indicate already confirmed
+        cur.execute("SELECT confirmed FROM emails WHERE email = ?", (email,))
+        row = cur.fetchone()
+        if row:
+            if row[0] == 1:
+                return False  # already confirmed
+            # update token and timestamp for unconfirmed
+            cur.execute("UPDATE emails SET token = ?, name = ?, opt_in = ?, created_at = ? WHERE email = ?",
+                        (token, name, 1 if opt_in else 0, now, email))
+        else:
+            cur.execute("INSERT INTO emails (name, email, token, confirmed, opt_in, created_at) VALUES (?, ?, ?, 0, ?, ?)",
+                        (name, email, token, 1 if opt_in else 0, now))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def confirm_email(token: str, db_path: str = DB_PATH) -> Optional[Dict]:
+    """Mark token as confirmed. Return the row dict when confirmed, else None."""
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, email, confirmed FROM emails WHERE token = ? LIMIT 1", (token,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        if row[3] == 1:
+            # already confirmed
+            return {"id": row[0], "name": row[1], "email": row[2], "confirmed": True}
+        now = datetime.utcnow().isoformat()
+        cur.execute("UPDATE emails SET confirmed = 1, confirmed_at = ? WHERE id = ?", (now, row[0]))
+        conn.commit()
+        return {"id": row[0], "name": row[1], "email": row[2], "confirmed": True}
+    finally:
+        conn.close()
+
+
+def email_exists(email: str, db_path: str = DB_PATH) -> bool:
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM emails WHERE email = ? LIMIT 1", (email,))
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+# -----------------------------------------------------------------------------
+# Email sending (SMTP) helper - extended to support Reply-To
+# -----------------------------------------------------------------------------
+def send_email_via_smtp(to_email: str, subject: str, body_text: str, reply_to: Optional[str] = None, html_body: Optional[str] = None) -> dict:
     smtp_host = os.environ.get("SMTP_HOST")
     smtp_port = int(os.environ.get("SMTP_PORT", "465"))
     smtp_user = os.environ.get("SMTP_USER")
@@ -195,13 +286,21 @@ def send_email_via_smtp(to_email: str, subject: str, body_text: str) -> dict:
 
     if not smtp_host or not smtp_user or not smtp_pass or not from_addr:
         logger.info("SMTP not fully configured; simulating send to %s", to_email)
-        return {"status_code": 250, "body": f"Simulated send to {to_email}", "headers": {}}
+        # In simulated mode include reply-to in headers for debugging
+        headers = {}
+        if reply_to:
+            headers["Reply-To"] = reply_to
+        return {"status_code": 250, "body": f"Simulated send to {to_email}", "headers": headers}
 
     msg = EmailMessage()
     msg["From"] = f"{from_name} <{from_addr}>" if from_name else from_addr
     msg["To"] = to_email
+    if reply_to:
+        msg["Reply-To"] = reply_to
     msg["Subject"] = subject
     msg.set_content(body_text)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
 
     try:
         if smtp_port == 465:
@@ -222,6 +321,114 @@ def send_email_via_smtp(to_email: str, subject: str, body_text: str) -> dict:
         return {"error": str(e)}
 
 
+def build_verification_email(user_email: str, token: str) -> (str, str): # type: ignore
+    app_base = os.environ.get("APP_BASE_URL", "http://localhost:5000").rstrip("/")
+    confirm_url = f"{app_base}/confirm_email?token={token}"
+    subject = "Confirm your email for Appraisal AutoPull"
+    plain = (
+        f"Hi,\n\n"
+        f"Thanks for saving your contact info with Whenever Home. Click the link below to confirm your email address:\n\n"
+        f"{confirm_url}\n\n"
+        f"If the link doesn't work, copy and paste it into your browser.\n\n"
+        f"Sent by {os.getenv('SENDER_NAME','Whenever Home')} on behalf of {user_email}\n"
+    )
+    html = f"""
+    <html>
+      <body>
+        <p>Hi,</p>
+        <p>Thanks for saving your contact info with Whenever Home. Click the button below to confirm your email address:</p>
+        <p><a href="{confirm_url}" style="display:inline-block;padding:12px 20px;background:#1a73e8;color:#fff;border-radius:6px;text-decoration:none;">Yes — confirm my email</a></p>
+        <p>If the button doesn't work, use this link:<br/><a href="{confirm_url}">{confirm_url}</a></p>
+        <hr/>
+        <small>Sent by {os.getenv('SENDER_NAME','Whenever Home')} on behalf of {user_email}. Reply-To is set to {user_email}.</small>
+      </body>
+    </html>
+    """
+    return subject, plain, html
+
+
+# -----------------------------------------------------------------------------
+# Routes: contact save + verify
+# -----------------------------------------------------------------------------
+@app.route("/save_email", methods=["POST"])
+def save_email():
+    """
+    Accept JSON or form data with fields:
+      - email (required)
+      - name (optional)
+      - opt_in (optional; true/false)
+    Creates a token, stores pending record, sends verification email to the provided address.
+    """
+    data = request.get_json(silent=True) or request.form or {}
+    email = (data.get("email") or "").strip()
+    name = (data.get("name") or "").strip() or None
+    opt_in_raw = data.get("opt_in")
+    opt_in = True
+    if isinstance(opt_in_raw, str):
+        opt_in = opt_in_raw.lower() in ("1", "true", "yes", "on")
+    elif isinstance(opt_in_raw, bool):
+        opt_in = opt_in_raw
+
+    if not email:
+        return jsonify({"success": False, "error": "Email is required."}), 400
+    if not EMAIL_RE.match(email):
+        return jsonify({"success": False, "error": "Invalid email format."}), 400
+
+    # Generate a token and add a pending db record
+    token = secrets.token_urlsafe(16)
+    try:
+        added = add_pending_email(email=email, name=name, token=token, opt_in=opt_in)
+        if added is False:
+            # Already confirmed
+            return jsonify({"success": True, "message": "Email already confirmed."}), 200
+    except Exception as e:
+        logger.exception("Failed to save pending email: %s", e)
+        return jsonify({"success": False, "error": "Server error saving email."}), 500
+
+    # Build and send verification email
+    try:
+        subject, plain, html = build_verification_email(email, token)
+        # Send verification to the user's email; Reply-To set to the user's email too (makes replies go back to them)
+        send_result = send_email_via_smtp(to_email=email, subject=subject, body_text=plain, reply_to=email, html_body=html)
+        logger.info("Verification send result: %s", send_result)
+    except Exception as e:
+        logger.exception("Failed to send verification email: %s", e)
+        return jsonify({"success": False, "error": "Failed to send verification email."}), 500
+
+    return jsonify({"success": True, "message": "Verification email sent. Check your inbox."}), 200
+
+
+@app.route("/confirm_email", methods=["GET"])
+def confirm_email_route():
+    token = request.args.get("token", "").strip()
+    if not token:
+        return make_response("<h3>Invalid verification link</h3>", 400)
+
+    try:
+        row = confirm_email(token)
+        if not row:
+            return make_response("<h3>Invalid or expired token</h3>", 400)
+    except Exception as e:
+        logger.exception("Failed to confirm email: %s", e)
+        return make_response("<h3>Server error while confirming</h3>", 500)
+
+    # Friendly HTML response (simple)
+    html = f"""
+    <html>
+      <head><title>Email confirmed</title></head>
+      <body style="font-family: sans-serif; max-width: 640px; margin: 40px auto;">
+        <h2>Thanks — your email is confirmed</h2>
+        <p>The address <strong>{row['email']}</strong> has been confirmed and saved. You can now use this contact when sending requests.</p>
+        <p><a href="/">Return to the app</a></p>
+      </body>
+    </html>
+    """
+    return make_response(html, 200)
+
+
+# -----------------------------------------------------------------------------
+# Existing send-requests route (unchanged apart from using send_email_via_smtp signature)
+# -----------------------------------------------------------------------------
 @app.route("/api/send-requests", methods=["POST"])
 def send_requests():
     try:
@@ -270,10 +477,15 @@ def send_requests():
             results["pva"] = {"error": "No PVA recipient configured"}
         else:
             try:
+                # When sending official requests, set Reply-To to the saved user (if provided in payload)
+                reply_to = None
+                if data.get("user_email"):
+                    reply_to = data.get("user_email")
                 results["pva"] = send_email_via_smtp(
                     to_email=pva_email,
                     subject=f"PVA request for {address}",
-                    body_text=pva_body
+                    body_text=pva_body,
+                    reply_to=reply_to
                 )
             except Exception as e:
                 logger.exception("Failed to send PVA email")
@@ -286,10 +498,14 @@ def send_requests():
             results["zoning"] = {"error": "No Zoning recipient configured"}
         else:
             try:
+                reply_to = None
+                if data.get("user_email"):
+                    reply_to = data.get("user_email")
                 results["zoning"] = send_email_via_smtp(
                     to_email=zoning_email,
                     subject=f"Zoning request for {address}",
-                    body_text=zoning_body
+                    body_text=zoning_body,
+                    reply_to=reply_to
                 )
             except Exception as e:
                 logger.exception("Failed to send Zoning email")
@@ -316,4 +532,6 @@ def send_requests():
 if __name__ == "__main__":
     csv_path = os.path.join(BASE_DIR, "mappings.csv")
     load_email_mappings_from_csv(csv_path)
+    # Initialize contacts DB for /save_email
+    init_contacts_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
